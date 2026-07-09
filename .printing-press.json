@@ -1,0 +1,26 @@
+{
+  "schema_version": 2,
+  "generated_at": "2026-07-09T00:00:00Z",
+  "printing_press_version": "4.27.1",
+  "api_name": "apple-voice-memos",
+  "display_name": "Apple Voice Memos",
+  "cli_name": "apple-voice-memos-pp-cli",
+  "creator": {
+    "handle": "0xble",
+    "name": "Brian Le"
+  },
+  "owner": "0xble",
+  "printer": "0xble",
+  "printer_name": "Brian Le",
+  "spec_url": "local-macos-voice-memos-store",
+  "spec_path": "README.md",
+  "spec_format": "local-store",
+  "spec_source": "sniffed/local-sqlite",
+  "category": "productivity",
+  "description": "Local, read-only CLI for Apple Voice Memos on macOS. Reads CloudRecordings.db and .m4a transcript atoms without network calls.",
+  "api_version": "macOS Voice Memos CloudRecordings.db",
+  "auth_type": "none",
+  "auth_env_vars": [],
+  "mcp_binary": "apple-voice-memos-pp-mcp",
+  "mcp_ready": "not-yet"
+}
