@@ -77,6 +77,38 @@ func TestSyncStoreFallsBackToHiddenAppAndQuitsOnlyOwnedInstance(t *testing.T) {
 	}
 }
 
+func TestSyncStoreSettlesAfterHiddenAppChange(t *testing.T) {
+	before := storeSnapshot{Count: 10, Latest: 100}
+	firstChange := storeSnapshot{Count: 11, Latest: 200}
+	settled := storeSnapshot{Count: 12, Latest: 300}
+	reads := 0
+
+	result, err := syncStore(context.Background(), syncOptions{DaemonWait: time.Nanosecond, AppWait: time.Second, PollInterval: time.Millisecond, SettleWait: time.Millisecond}, syncHooks{
+		Snapshot: func() (storeSnapshot, error) {
+			reads++
+			switch {
+			case reads < 4:
+				return before, nil
+			case reads == 4:
+				return firstChange, nil
+			default:
+				return settled, nil
+			}
+		},
+		KickDaemon:      func() error { return nil },
+		AppRunning:      func() (bool, error) { return false, nil },
+		LaunchHidden:    func() error { return nil },
+		QuitLaunchedApp: func() error { return nil },
+		Sleep:           func(time.Duration) {},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.After.Count != settled.Count || result.After.Latest != settled.Latest {
+		t.Fatalf("after=%+v want settled=%+v", result.After, settled)
+	}
+}
+
 func TestSyncStoreDoesNotQuitAppThatWasAlreadyRunning(t *testing.T) {
 	before := storeSnapshot{Count: 10, Latest: 100}
 	calls := []string{}
@@ -94,6 +126,9 @@ func TestSyncStoreDoesNotQuitAppThatWasAlreadyRunning(t *testing.T) {
 	}
 	if result.AppLaunched || result.AppQuit {
 		t.Fatalf("must not own or quit an existing app: %+v", result)
+	}
+	if !result.Refreshed || result.FreshnessConfirmed {
+		t.Fatalf("unexpected freshness semantics: %+v", result)
 	}
 	for _, call := range calls {
 		if call == "quit" || call == "launch" {

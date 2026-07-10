@@ -1,35 +1,32 @@
 ---
-name: pp-apple-voice-memos
-description: Use apple-voice-memos-pp-cli to list, search, export, and extract embedded transcripts from Apple Voice Memos on macOS.
+name: apple-voice-memos
+description: Use apple-voice-memos-pp-cli to refresh, list, search, export, and extract embedded transcripts from Apple Voice Memos on macOS.
 tags: [apple, voice-memos, macos, transcription, cli, printing-press]
 ---
 
 # Apple Voice Memos CLI
 
-Use this skill when Brian asks to work with Apple Voice Memos recordings on macOS.
+Use this skill when the user asks to work with Apple Voice Memos recordings on macOS.
 
-## Tool
+## Prerequisite
 
-```bash
-/Users/brianle/Projects/apple-voice-memos-pp-cli/bin/apple-voice-memos-pp-cli
-```
-
-If installed on PATH:
+The `apple-voice-memos-pp-cli` binary must be on `PATH`. Verify access before handling private recording data:
 
 ```bash
-apple-voice-memos-pp-cli
+apple-voice-memos-pp-cli doctor --agent
 ```
 
 ## Safe defaults
 
 - Reads local macOS Voice Memos data only.
-- Does not call a network API.
-- Does not modify Apple's database.
-- `recent` refreshes through `voicememod` by default. Use `--cached` only when stale local data is acceptable.
+- Makes no application-level network requests.
+- Opens Apple’s database read-only and query-only.
+- Never modifies or deletes recordings.
+- `recent` refreshes through `voicememod` by default. Use `--cached` only when stale local data is explicitly acceptable.
 - `list` is cached by default. Use `list --fresh` when current iCloud state matters.
-- The sync fallback launches Voice Memos hidden and quits only the app instance the CLI launched.
-- `export` copies a selected `.m4a` to an output directory.
-- Prefer `--agent` for JSON and stable scripting.
+- The sync fallback launches Voice Memos hidden and terminates only the process instance the CLI launched.
+- `export` copies one selected `.m4a` to a destination directory with private file permissions.
+- Prefer `--agent` for machine-readable output.
 
 ## Common commands
 
@@ -43,6 +40,10 @@ apple-voice-memos-pp-cli transcript <id> --agent
 apple-voice-memos-pp-cli export <id> --out ~/Downloads --agent
 ```
 
-## Notes
+## Operational guidance
 
-`transcript` extracts Apple's embedded transcript from the `.m4a` `tsrp` atom. If Apple has not generated a transcript for a memo, the command reports that honestly. Use another STT tool only when embedded transcripts are absent.
+- When the user says “latest” or “recent,” do not add `--cached`.
+- If refresh fails, report the failure rather than silently presenting cached records as current.
+- Do not expose titles, transcripts, UUIDs, or paths beyond what the user requested.
+- Do not attach a database or recording to bug reports.
+- `transcript` extracts Apple’s embedded `.m4a` `tsrp` transcript. If it is absent, report that honestly. Use another STT tool only when the user asks for transcription.

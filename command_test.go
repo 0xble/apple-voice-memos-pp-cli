@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestRecentIsFreshByDefaultAndSupportsCachedOverride(t *testing.T) {
 	cmd := cmdRecent()
@@ -32,5 +35,37 @@ func TestRootIncludesSyncCommand(t *testing.T) {
 	}
 	if cmd == root || cmd.Name() != "sync" {
 		t.Fatalf("sync command missing; found %q", cmd.Name())
+	}
+}
+
+func TestRootExposesConfigurableSyncWaits(t *testing.T) {
+	root := buildRootCommand()
+	for _, name := range []string{"daemon-wait", "app-wait", "poll-interval", "settle-wait"} {
+		if root.PersistentFlags().Lookup(name) == nil {
+			t.Fatalf("missing persistent --%s flag", name)
+		}
+	}
+}
+
+func TestMemoListJSONCarriesFreshnessMetadata(t *testing.T) {
+	result := syncResult{SchemaVersion: 1, Refreshed: true, FreshnessConfirmed: false}
+	out := newMemoListOutput([]memo{{ID: 7}}, "fresh", &result)
+	data, err := json.Marshal(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded["schema_version"] != float64(1) {
+		t.Fatalf("schema_version=%v", decoded["schema_version"])
+	}
+	freshness := decoded["freshness"].(map[string]any)
+	if freshness["mode"] != "fresh" || freshness["result"] == nil {
+		t.Fatalf("freshness=%v", freshness)
+	}
+	if len(decoded["memos"].([]any)) != 1 {
+		t.Fatalf("memos=%v", decoded["memos"])
 	}
 }

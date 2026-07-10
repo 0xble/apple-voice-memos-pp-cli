@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -20,13 +21,16 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/sys/unix"
 )
 
 const (
-	cliName           = "apple-voice-memos-pp-cli"
-	version           = "0.2.0-local"
-	coreDataEpochUnix = 978307200 // 2001-01-01T00:00:00Z
+	cliName                = "apple-voice-memos-pp-cli"
+	coreDataEpochUnix      = 978307200 // 2001-01-01T00:00:00Z
+	maxTranscriptAtomBytes = 8 << 20
 )
+
+var version = "dev"
 
 type config struct {
 	DBPath        string
@@ -34,6 +38,10 @@ type config struct {
 	JSON          bool
 	Agent         bool
 	NoColor       bool
+	DaemonWait    time.Duration
+	AppWait       time.Duration
+	PollInterval  time.Duration
+	SettleWait    time.Duration
 }
 
 type memo struct {
@@ -53,18 +61,28 @@ var cfg config
 
 func main() {
 	if err := buildRootCommand().Execute(); err != nil {
+		if cfg.Agent {
+			b, marshalErr := json.Marshal(map[string]any{"schema_version": 1, "error": err.Error()})
+			if marshalErr == nil {
+				fmt.Fprintln(os.Stderr, string(b))
+			}
+		} else {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+		}
 		os.Exit(1)
 	}
 }
 
 func buildRootCommand() *cobra.Command {
 	root := &cobra.Command{
-		Use:     cliName,
-		Short:   "Local, read-only CLI for Apple Voice Memos on macOS",
-		Version: version,
+		Use:           cliName,
+		Short:         "Local, read-only CLI for Apple Voice Memos on macOS",
+		Version:       version,
+		SilenceUsage:  true,
+		SilenceErrors: true,
 		Long: `Local, read-only CLI for Apple Voice Memos on macOS.
 
-Reads the Voice Memos SQLite store and .m4a files synced by iCloud. By default it
+Reads the Voice Memos SQLite store and recording media files synced by iCloud. By default it
 uses Apple's modern path:
 ~/Library/Group Containers/group.com.apple.VoiceMemos.shared/Recordings/CloudRecordings.db
 
@@ -75,14 +93,20 @@ No network calls. No writes to Apple's database. Export copies audio files only 
 	root.PersistentFlags().BoolVar(&cfg.JSON, "json", false, "emit JSON")
 	root.PersistentFlags().BoolVar(&cfg.Agent, "agent", false, "agent mode: JSON, no color, non-interactive")
 	root.PersistentFlags().BoolVar(&cfg.NoColor, "no-color", false, "disable color output")
+	root.PersistentFlags().DurationVar(&cfg.DaemonWait, "daemon-wait", 3*time.Second, "time to wait for voicememod before hidden-app fallback")
+	root.PersistentFlags().DurationVar(&cfg.AppWait, "app-wait", 12*time.Second, "time to wait after launching Voice Memos hidden")
+	root.PersistentFlags().DurationVar(&cfg.PollInterval, "poll-interval", 500*time.Millisecond, "store-change polling interval")
+	root.PersistentFlags().DurationVar(&cfg.SettleWait, "settle-wait", 2*time.Second, "additional wait after the store first changes")
 	root.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
 		if cfg.Agent {
 			cfg.JSON = true
 			cfg.NoColor = true
 		}
+		if cfg.DaemonWait < 0 || cfg.AppWait < 0 || cfg.SettleWait < 0 || cfg.PollInterval <= 0 {
+			return errors.New("sync waits must be non-negative and poll-interval must be positive")
+		}
 		return nil
 	}
-
 	root.AddCommand(cmdDoctor(), cmdSync(), cmdList(), cmdRecent(), cmdTranscript(), cmdExport(), cmdAgentContext(), cmdWhich())
 	return root
 }
@@ -93,29 +117,45 @@ func cmdDoctor() *cobra.Command {
 		Short: "Check access to the local Apple Voice Memos store",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			dbPath, recDir := resolvePaths()
-			out := map[string]any{"cli": cliName, "version": version, "db_path": dbPath, "recordings_dir": recDir}
+			out := map[string]any{"schema_version": 1, "cli": cliName, "version": version, "db_path": dbPath, "recordings_dir": recDir}
 			if _, err := os.Stat(dbPath); err != nil {
 				out["ok"] = false
 				out["error"] = err.Error()
-				printJSON(out)
-				return fmt.Errorf("Voice Memos DB not accessible: %w", err)
+				if !cfg.Agent {
+					printJSON(out)
+				}
+				return fmt.Errorf("voice memos database not accessible: %w", err)
 			}
 			db, err := openDB(dbPath)
 			if err != nil {
 				out["ok"] = false
 				out["error"] = err.Error()
-				printJSON(out)
+				if !cfg.Agent {
+					printJSON(out)
+				}
 				return err
 			}
-			defer db.Close()
+			defer func() { _ = db.Close() }()
+			if err := validateVoiceMemosSchema(db); err != nil {
+				out["ok"] = false
+				out["schema_compatible"] = false
+				out["error"] = err.Error()
+				if !cfg.Agent {
+					printJSON(out)
+				}
+				return err
+			}
 			var count int
 			if err := db.QueryRow("SELECT count(*) FROM ZCLOUDRECORDING").Scan(&count); err != nil {
 				out["ok"] = false
 				out["error"] = err.Error()
-				printJSON(out)
+				if !cfg.Agent {
+					printJSON(out)
+				}
 				return err
 			}
 			out["ok"] = true
+			out["schema_compatible"] = true
 			out["recording_count"] = count
 			printJSON(out)
 			return nil
@@ -146,11 +186,22 @@ func cmdList() *cobra.Command {
 		Use:   "list",
 		Short: "List Voice Memos metadata",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if limit < 0 {
+				return errors.New("--limit must be non-negative")
+			}
+			if offset < 0 {
+				return errors.New("--offset must be non-negative")
+			}
+			if format != "table" && format != "json" && format != "csv" {
+				return fmt.Errorf("unsupported --format %q; use table, json, or csv", format)
+			}
+			var refreshResult *syncResult
 			if fresh {
 				result, err := runSync(cmd.Context())
 				if err != nil {
 					return fmt.Errorf("refresh Voice Memos store: %w", err)
 				}
+				refreshResult = &result
 				if result.Warning != "" && !cfg.JSON {
 					cmd.PrintErrf("sync: %s\n", result.Warning)
 				}
@@ -161,7 +212,11 @@ func cmdList() *cobra.Command {
 			}
 			switch format {
 			case "json":
-				printJSON(memos)
+				mode := "cached"
+				if fresh {
+					mode = "fresh"
+				}
+				printJSON(newMemoListOutput(memos, mode, refreshResult))
 			case "csv":
 				return printCSV(memos)
 			default:
@@ -192,11 +247,16 @@ func cmdRecent() *cobra.Command {
 		Use:   "recent",
 		Short: "Refresh and list recent Voice Memos",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if limit < 0 {
+				return errors.New("--limit must be non-negative")
+			}
+			var refreshResult *syncResult
 			if !cached {
 				result, err := runSync(cmd.Context())
 				if err != nil {
 					return fmt.Errorf("refresh Voice Memos store: %w (pass --cached to use local data)", err)
 				}
+				refreshResult = &result
 				if result.Warning != "" && !cfg.JSON {
 					cmd.PrintErrf("sync: %s\n", result.Warning)
 				}
@@ -206,7 +266,11 @@ func cmdRecent() *cobra.Command {
 				return err
 			}
 			if cfg.JSON {
-				printJSON(memos)
+				mode := "fresh"
+				if cached {
+					mode = "cached"
+				}
+				printJSON(newMemoListOutput(memos, mode, refreshResult))
 			} else {
 				printTable(memos)
 			}
@@ -300,7 +364,7 @@ func cmdAgentContext() *cobra.Command {
 	var pretty bool
 	c := &cobra.Command{Use: "agent-context", Short: "Describe CLI capabilities for agents", RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := map[string]any{
-			"cli": cliName, "version": version, "side_effects": "read-only except export copies selected audio files", "auth": "none", "network": false,
+			"cli": cliName, "version": version, "side_effects": "reads local metadata; refresh may trigger voicememod and launch then clean up a hidden Voice Memos instance; export copies selected audio files", "auth": "none", "network": false,
 			"commands":   []string{"doctor", "sync", "list", "recent", "transcript", "export", "which", "agent-context"},
 			"default_db": defaultDBPath(), "default_recordings_dir": defaultRecordingsDir(),
 		}
@@ -352,7 +416,79 @@ func resolvePaths() (string, string) {
 	}
 	return db, rec
 }
-func openDB(path string) (*sql.DB, error) { return sql.Open("sqlite", "file:"+path+"?mode=ro") }
+func openDB(path string) (*sql.DB, error) {
+	u := &url.URL{Scheme: "file", Path: filepath.Clean(path)}
+	q := u.Query()
+	q.Set("mode", "ro")
+	q.Add("_pragma", "query_only(1)")
+	dsn := "file:" + u.EscapedPath() + "?" + q.Encode()
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+func resolveRecordingPath(base, name string) (string, error) {
+	if name == "" || filepath.IsAbs(name) {
+		return "", errors.New("recording path must be relative")
+	}
+	base = filepath.Clean(base)
+	joined := filepath.Join(base, filepath.Clean(name))
+	rel, err := filepath.Rel(base, joined)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", errors.New("recording path escapes recordings directory")
+	}
+	if resolved, err := filepath.EvalSymlinks(joined); err == nil {
+		resolvedBase, baseErr := filepath.EvalSymlinks(base)
+		if baseErr == nil {
+			rel, err = filepath.Rel(resolvedBase, resolved)
+			if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				return "", errors.New("recording symlink escapes recordings directory")
+			}
+			joined = resolved
+		}
+	}
+	return joined, nil
+}
+
+func validateVoiceMemosSchema(db *sql.DB) error {
+	rows, err := db.Query("PRAGMA table_info(ZCLOUDRECORDING)")
+	if err != nil {
+		return fmt.Errorf("inspect Voice Memos schema: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	columns := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull, primaryKey int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return fmt.Errorf("inspect Voice Memos schema: %w", err)
+		}
+		columns[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("inspect Voice Memos schema: %w", err)
+	}
+	required := []string{"Z_PK", "ZDATE", "ZPATH", "ZDURATION", "ZLOCALDURATION", "ZUNIQUEID", "ZENCRYPTEDTITLE", "ZCUSTOMLABEL"}
+	var missing []string
+	for _, name := range required {
+		if !columns[name] {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("unsupported Voice Memos schema: missing columns %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
 
 func queryMemos(limit, offset int, search, after, before string) ([]memo, error) {
 	dbPath, recDir := resolvePaths()
@@ -360,7 +496,10 @@ func queryMemos(limit, offset int, search, after, before string) ([]memo, error)
 	if err != nil {
 		return nil, err
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
+	if err := validateVoiceMemosSchema(db); err != nil {
+		return nil, err
+	}
 	clauses := []string{}
 	args := []any{}
 	if search != "" {
@@ -393,7 +532,7 @@ func queryMemos(limit, offset int, search, after, before string) ([]memo, error)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []memo
 	for rows.Next() {
 		var id int64
@@ -403,7 +542,13 @@ func queryMemos(limit, offset int, search, after, before string) ([]memo, error)
 		if err := rows.Scan(&id, &uuid, &title, &zdate, &dur, &filename); err != nil {
 			return nil, err
 		}
-		path := filepath.Join(recDir, filename)
+		if math.IsNaN(zdate) || math.IsInf(zdate, 0) || math.IsNaN(dur) || math.IsInf(dur, 0) {
+			return nil, fmt.Errorf("recording %d contains non-finite date or duration", id)
+		}
+		path, pathErr := resolveRecordingPath(recDir, filename)
+		if pathErr != nil {
+			return nil, fmt.Errorf("recording %d has unsafe path %q: %w", id, filename, pathErr)
+		}
 		exists := fileExists(path)
 		out = append(out, memo{ID: id, UUID: uuid, Title: title, Date: coreDataToTime(zdate), DurationSec: dur, Duration: formatDuration(dur), Filename: filename, Path: path, HasTranscript: exists && hasTranscript(path), Exists: exists})
 	}
@@ -478,12 +623,16 @@ func readAtomHeader(r io.ReadSeeker) (typ string, size int64, header int64, err 
 	if size == 1 {
 		ext := make([]byte, 8)
 		if _, err = io.ReadFull(r, ext); err != nil {
-			return
+			return "", 0, 0, err
 		}
-		size = int64(0)
+		var extended uint64
 		for _, b := range ext {
-			size = (size << 8) | int64(b)
+			extended = (extended << 8) | uint64(b)
 		}
+		if extended > math.MaxInt64 {
+			return "", 0, 0, errors.New("atom size exceeds supported range")
+		}
+		size = int64(extended)
 		header = 16
 	}
 	return
@@ -498,11 +647,14 @@ func findAtom(r io.ReadSeeker, end int64, target string) (atomEnd int64, dataSta
 		if err != nil {
 			return 0, 0, err
 		}
-		if size <= 0 {
-			return 0, 0, os.ErrNotExist
+		if size == 0 {
+			size = end - pos
 		}
 		atomEnd = pos + size
 		dataStart = pos + header
+		if size < header || atomEnd < dataStart || atomEnd > end {
+			return 0, 0, fmt.Errorf("invalid %s atom bounds", typ)
+		}
 		if typ == target {
 			return atomEnd, dataStart, nil
 		}
@@ -511,33 +663,57 @@ func findAtom(r io.ReadSeeker, end int64, target string) (atomEnd int64, dataSta
 		}
 	}
 }
+func findTranscriptAtom(r io.ReadSeeker, moovEnd int64) (int64, int64, error) {
+	for {
+		trakEnd, _, err := findAtom(r, moovEnd, "trak")
+		if err != nil {
+			return 0, 0, errors.New("tsrp transcript atom not found")
+		}
+		udtaEnd, _, udtaErr := findAtom(r, trakEnd, "udta")
+		if udtaErr == nil {
+			if tsrpEnd, dataStart, tsrpErr := findAtom(r, udtaEnd, "tsrp"); tsrpErr == nil {
+				return tsrpEnd, dataStart, nil
+			}
+		}
+		if _, err := r.Seek(trakEnd, io.SeekStart); err != nil {
+			return 0, 0, err
+		}
+	}
+}
+
 func hasTranscript(path string) bool { _, _, err := readTranscriptJSON(path); return err == nil }
 func readTranscriptJSON(path string) (map[string]any, []byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, nil, err
 	}
-	defer f.Close()
-	end, _ := f.Seek(0, io.SeekEnd)
-	f.Seek(0, io.SeekStart)
+	defer func() { _ = f.Close() }()
+	end, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
+		return nil, nil, err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, nil, err
+	}
 	moovEnd, _, err := findAtom(f, end, "moov")
 	if err != nil {
 		return nil, nil, errors.New("moov atom not found")
 	}
-	trakEnd, _, err := findAtom(f, moovEnd, "trak")
+	tsrpEnd, dataStart, err := findTranscriptAtom(f, moovEnd)
 	if err != nil {
-		return nil, nil, errors.New("trak atom not found")
+		return nil, nil, err
 	}
-	udtaEnd, _, err := findAtom(f, trakEnd, "udta")
-	if err != nil {
-		return nil, nil, errors.New("udta atom not found")
+	dataSize := tsrpEnd - dataStart
+	if dataSize <= 0 {
+		return nil, nil, errors.New("empty tsrp transcript atom")
 	}
-	tsrpEnd, dataStart, err := findAtom(f, udtaEnd, "tsrp")
-	if err != nil {
-		return nil, nil, errors.New("tsrp transcript atom not found")
+	if dataSize > maxTranscriptAtomBytes {
+		return nil, nil, fmt.Errorf("tsrp transcript atom too large: %d bytes", dataSize)
 	}
-	f.Seek(dataStart, io.SeekStart)
-	data := make([]byte, tsrpEnd-dataStart)
+	if _, err := f.Seek(dataStart, io.SeekStart); err != nil {
+		return nil, nil, err
+	}
+	data := make([]byte, dataSize)
 	if _, err := io.ReadFull(f, data); err != nil {
 		return nil, nil, err
 	}
@@ -552,6 +728,25 @@ func readTranscriptJSON(path string) (map[string]any, []byte, error) {
 type segment struct {
 	Time float64 `json:"time"`
 	Text string  `json:"text"`
+}
+
+type freshnessOutput struct {
+	Mode   string      `json:"mode"`
+	Result *syncResult `json:"result,omitempty"`
+}
+
+type memoListOutput struct {
+	SchemaVersion int             `json:"schema_version"`
+	Freshness     freshnessOutput `json:"freshness"`
+	Memos         []memo          `json:"memos"`
+}
+
+func newMemoListOutput(memos []memo, mode string, result *syncResult) memoListOutput {
+	return memoListOutput{
+		SchemaVersion: 1,
+		Freshness:     freshnessOutput{Mode: mode, Result: result},
+		Memos:         memos,
+	}
 }
 
 func extractTranscript(path string) (string, []segment, error) {
@@ -706,11 +901,15 @@ func printTable(memos []memo) {
 }
 func printCSV(memos []memo) error {
 	w := csv.NewWriter(os.Stdout)
-	defer w.Flush()
-	w.Write([]string{"id", "uuid", "title", "date", "duration", "filename", "path", "has_transcript", "exists"})
-	for _, m := range memos {
-		w.Write([]string{strconv.FormatInt(m.ID, 10), m.UUID, m.Title, m.Date.Format(time.RFC3339), m.Duration, m.Filename, m.Path, strconv.FormatBool(m.HasTranscript), strconv.FormatBool(m.Exists)})
+	if err := w.Write([]string{"id", "uuid", "title", "date", "duration", "filename", "path", "has_transcript", "exists"}); err != nil {
+		return err
 	}
+	for _, m := range memos {
+		if err := w.Write([]string{strconv.FormatInt(m.ID, 10), m.UUID, m.Title, m.Date.Format(time.RFC3339), m.Duration, m.Filename, m.Path, strconv.FormatBool(m.HasTranscript), strconv.FormatBool(m.Exists)}); err != nil {
+			return err
+		}
+	}
+	w.Flush()
 	return w.Error()
 }
 func fileExists(p string) bool { _, err := os.Stat(p); return err == nil }
@@ -719,13 +918,27 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer in.Close()
-	out, err := os.Create(dst)
+	defer func() { _ = in.Close() }()
+	if info, err := os.Lstat(dst); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing symlink destination: %s", dst)
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	fd, err := unix.Open(dst, unix.O_WRONLY|unix.O_CREAT|unix.O_TRUNC|unix.O_NOFOLLOW, 0600)
 	if err != nil {
 		return err
 	}
-	defer out.Close()
+	out := os.NewFile(uintptr(fd), dst)
+	if out == nil {
+		_ = unix.Close(fd)
+		return errors.New("create destination file")
+	}
+	if err := out.Chmod(0600); err != nil {
+		_ = out.Close()
+		return err
+	}
 	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
 		return err
 	}
 	return out.Close()

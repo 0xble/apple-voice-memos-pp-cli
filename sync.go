@@ -27,6 +27,7 @@ type syncOptions struct {
 	DaemonWait   time.Duration
 	AppWait      time.Duration
 	PollInterval time.Duration
+	SettleWait   time.Duration
 }
 
 type syncHooks struct {
@@ -39,15 +40,17 @@ type syncHooks struct {
 }
 
 type syncResult struct {
-	Synced      bool          `json:"synced"`
-	Changed     bool          `json:"changed"`
-	Method      string        `json:"method"`
-	AppLaunched bool          `json:"app_launched"`
-	AppQuit     bool          `json:"app_quit"`
-	Before      storeSnapshot `json:"before"`
-	After       storeSnapshot `json:"after"`
-	ElapsedMS   int64         `json:"elapsed_ms"`
-	Warning     string        `json:"warning,omitempty"`
+	SchemaVersion      int           `json:"schema_version"`
+	Refreshed          bool          `json:"refreshed"`
+	Changed            bool          `json:"changed"`
+	FreshnessConfirmed bool          `json:"freshness_confirmed"`
+	Method             string        `json:"method"`
+	AppLaunched        bool          `json:"app_launched"`
+	AppQuit            bool          `json:"app_quit"`
+	Before             storeSnapshot `json:"before"`
+	After              storeSnapshot `json:"after"`
+	ElapsedMS          int64         `json:"elapsed_ms"`
+	Warning            string        `json:"warning,omitempty"`
 }
 
 func syncStore(ctx context.Context, opts syncOptions, hooks syncHooks) (syncResult, error) {
@@ -56,14 +59,14 @@ func syncStore(ctx context.Context, opts syncOptions, hooks syncHooks) (syncResu
 	if err != nil {
 		return syncResult{}, err
 	}
-	result := syncResult{Before: before, After: before, Method: "voicememod"}
+	result := syncResult{SchemaVersion: 1, Before: before, After: before, Method: "voicememod"}
 	if err := hooks.KickDaemon(); err != nil {
 		result.Warning = "could not kick voicememod: " + err.Error()
 	}
 	if after, changed, err := pollForChange(ctx, before, opts.DaemonWait, opts.PollInterval, hooks); err != nil {
 		return result, err
 	} else if changed {
-		result.Synced, result.Changed, result.After = true, true, after
+		result.Refreshed, result.Changed, result.FreshnessConfirmed, result.After = true, true, true, after
 		result.ElapsedMS = time.Since(started).Milliseconds()
 		return result, nil
 	}
@@ -81,6 +84,9 @@ func syncStore(ctx context.Context, opts syncOptions, hooks syncHooks) (syncResu
 	}
 
 	after, changed, pollErr := pollForChange(ctx, before, opts.AppWait, opts.PollInterval, hooks)
+	if pollErr == nil && changed && opts.SettleWait > 0 {
+		after, pollErr = waitForSettle(ctx, after, opts.SettleWait, opts.PollInterval, hooks)
+	}
 	if result.AppLaunched {
 		if err := hooks.QuitLaunchedApp(); err == nil {
 			result.AppQuit = true
@@ -92,8 +98,9 @@ func syncStore(ctx context.Context, opts syncOptions, hooks syncHooks) (syncResu
 		return result, pollErr
 	}
 	result.After = after
+	result.Refreshed = true
 	result.Changed = changed
-	result.Synced = changed
+	result.FreshnessConfirmed = changed
 	if !changed && result.Warning == "" {
 		result.Warning = "store did not change during the sync window; it may already be current"
 	}
@@ -131,6 +138,31 @@ func pollForChange(ctx context.Context, before storeSnapshot, wait, interval tim
 	return last, false, nil
 }
 
+func waitForSettle(ctx context.Context, current storeSnapshot, wait, interval time.Duration, hooks syncHooks) (storeSnapshot, error) {
+	if interval <= 0 {
+		interval = 250 * time.Millisecond
+	}
+	attempts := int(math.Ceil(float64(wait) / float64(interval)))
+	if attempts < 1 {
+		attempts = 1
+	}
+	last := current
+	for i := 0; i < attempts; i++ {
+		select {
+		case <-ctx.Done():
+			return last, ctx.Err()
+		default:
+		}
+		hooks.Sleep(interval)
+		next, err := hooks.Snapshot()
+		if err != nil {
+			return last, err
+		}
+		last = next
+	}
+	return last, nil
+}
+
 func snapshotsDiffer(a, b storeSnapshot) bool {
 	return a.Count != b.Count || a.Latest != b.Latest || !a.DBMod.Equal(b.DBMod) || !a.WALMod.Equal(b.WALMod)
 }
@@ -140,7 +172,10 @@ func snapshotStore(dbPath string) (storeSnapshot, error) {
 	if err != nil {
 		return storeSnapshot{}, err
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
+	if err := validateVoiceMemosSchema(db); err != nil {
+		return storeSnapshot{}, err
+	}
 	var count int
 	var latest sql.NullFloat64
 	if err := db.QueryRow("SELECT count(*), max(ZDATE) FROM ZCLOUDRECORDING").Scan(&count, &latest); err != nil {
@@ -160,8 +195,8 @@ func snapshotStore(dbPath string) (storeSnapshot, error) {
 	return s, nil
 }
 
-func processIDs(name string) ([]int, error) {
-	out, err := exec.Command("pgrep", "-x", name).Output()
+func processIDs(ctx context.Context, name string) ([]int, error) {
+	out, err := exec.CommandContext(ctx, "pgrep", "-x", name).Output()
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
@@ -179,17 +214,29 @@ func processIDs(name string) ([]int, error) {
 	return ids, nil
 }
 
-func realSyncHooks(dbPath string) syncHooks {
+func processIdentity(ctx context.Context, id int) (string, error) {
+	out, err := exec.CommandContext(ctx, "ps", "-p", strconv.Itoa(id), "-o", "lstart=", "-o", "comm=").Output()
+	if err != nil {
+		return "", err
+	}
+	identity := strings.TrimSpace(string(out))
+	if identity == "" || !strings.Contains(identity, "VoiceMemos") {
+		return "", fmt.Errorf("process %d is not VoiceMemos", id)
+	}
+	return identity, nil
+}
+
+func realSyncHooks(ctx context.Context, dbPath string) syncHooks {
 	var beforePIDs = map[int]bool{}
-	var ownedPIDs []int
+	var ownedPIDs = map[int]string{}
 	return syncHooks{
 		Snapshot: func() (storeSnapshot, error) { return snapshotStore(dbPath) },
 		KickDaemon: func() error {
 			target := fmt.Sprintf("gui/%d/com.apple.voicememod", os.Getuid())
-			return exec.Command("launchctl", "kickstart", target).Run()
+			return exec.CommandContext(ctx, "launchctl", "kickstart", target).Run()
 		},
 		AppRunning: func() (bool, error) {
-			ids, err := processIDs("VoiceMemos")
+			ids, err := processIDs(ctx, "VoiceMemos")
 			if err != nil {
 				return false, err
 			}
@@ -203,24 +250,43 @@ func realSyncHooks(dbPath string) syncHooks {
 			if _, err := os.Stat(app); err != nil {
 				return err
 			}
-			if err := exec.Command("open", "-gj", app).Run(); err != nil {
+			if err := exec.CommandContext(ctx, "open", "-gj", "-n", app).Run(); err != nil {
 				return err
 			}
-			time.Sleep(500 * time.Millisecond)
-			ids, err := processIDs("VoiceMemos")
-			if err != nil {
-				return err
-			}
-			for _, id := range ids {
-				if !beforePIDs[id] {
-					ownedPIDs = append(ownedPIDs, id)
+			for attempt := 0; attempt < 20; attempt++ {
+				ids, err := processIDs(ctx, "VoiceMemos")
+				if err != nil {
+					return err
 				}
+				var candidates []int
+				for _, id := range ids {
+					if !beforePIDs[id] {
+						candidates = append(candidates, id)
+					}
+				}
+				if len(candidates) > 1 {
+					return errors.New("multiple new Voice Memos processes appeared; refusing automatic cleanup")
+				}
+				if len(candidates) == 1 {
+					identity, err := processIdentity(ctx, candidates[0])
+					if err != nil {
+						return err
+					}
+					ownedPIDs[candidates[0]] = identity
+					return nil
+				}
+				time.Sleep(250 * time.Millisecond)
 			}
-			return nil
+			return errors.New("voice memos launched but no owned process appeared")
 		},
 		QuitLaunchedApp: func() error {
 			var errs []string
-			for _, id := range ownedPIDs {
+			for id, expectedIdentity := range ownedPIDs {
+				identity, identityErr := processIdentity(ctx, id)
+				if identityErr != nil || identity != expectedIdentity {
+					errs = append(errs, fmt.Sprintf("process %d identity changed; refusing to signal", id))
+					continue
+				}
 				p, err := os.FindProcess(id)
 				if err != nil {
 					errs = append(errs, err.Error())
@@ -233,14 +299,49 @@ func realSyncHooks(dbPath string) syncHooks {
 			if len(errs) > 0 {
 				return errors.New(strings.Join(errs, "; "))
 			}
-			return nil
+			for attempt := 0; attempt < 20; attempt++ {
+				ids, err := processIDs(ctx, "VoiceMemos")
+				if err != nil {
+					return err
+				}
+				remaining := false
+				for _, runningID := range ids {
+					for ownedID := range ownedPIDs {
+						if runningID == ownedID {
+							remaining = true
+						}
+					}
+				}
+				if !remaining {
+					return nil
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+			return errors.New("timed out waiting for CLI-launched Voice Memos to quit")
 		},
 		Sleep: time.Sleep,
 	}
 }
 
 func defaultSyncOptions() syncOptions {
-	return syncOptions{DaemonWait: 3 * time.Second, AppWait: 12 * time.Second, PollInterval: 500 * time.Millisecond}
+	return syncOptions{DaemonWait: 3 * time.Second, AppWait: 12 * time.Second, PollInterval: 500 * time.Millisecond, SettleWait: 2 * time.Second}
+}
+
+func configuredSyncOptions() syncOptions {
+	opts := defaultSyncOptions()
+	if cfg.DaemonWait >= 0 {
+		opts.DaemonWait = cfg.DaemonWait
+	}
+	if cfg.AppWait >= 0 {
+		opts.AppWait = cfg.AppWait
+	}
+	if cfg.PollInterval > 0 {
+		opts.PollInterval = cfg.PollInterval
+	}
+	if cfg.SettleWait >= 0 {
+		opts.SettleWait = cfg.SettleWait
+	}
+	return opts
 }
 
 func runSync(ctx context.Context) (syncResult, error) {
@@ -248,5 +349,9 @@ func runSync(ctx context.Context) (syncResult, error) {
 	if _, err := os.Stat(dbPath); err != nil {
 		return syncResult{}, err
 	}
-	return syncStore(ctx, defaultSyncOptions(), realSyncHooks(filepath.Clean(dbPath)))
+	opts := configuredSyncOptions()
+	total := opts.DaemonWait + opts.AppWait + opts.SettleWait + 10*time.Second
+	bounded, cancel := context.WithTimeout(ctx, total)
+	defer cancel()
+	return syncStore(bounded, opts, realSyncHooks(bounded, filepath.Clean(dbPath)))
 }
