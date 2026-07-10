@@ -28,15 +28,29 @@ cp bin/apple-voice-memos-pp-cli ~/.local/bin/
 
 ```bash
 apple-voice-memos-pp-cli doctor --json
+apple-voice-memos-pp-cli sync
 apple-voice-memos-pp-cli list --limit 20
-apple-voice-memos-pp-cli list --search "meeting" --json
+apple-voice-memos-pp-cli list --fresh --search "meeting" --json
 apple-voice-memos-pp-cli recent --limit 10
+apple-voice-memos-pp-cli recent --cached --limit 10
 apple-voice-memos-pp-cli transcript <id|uuid|filename>
 apple-voice-memos-pp-cli transcript <id> --raw
 apple-voice-memos-pp-cli export <id|uuid|filename> --out ~/Downloads
 apple-voice-memos-pp-cli agent-context --pretty
 apple-voice-memos-pp-cli which "summarize memo" --json
 ```
+
+## Freshness and iCloud synchronization
+
+`recent` refreshes before reading by default. It first restarts macOS's `com.apple.voicememod` LaunchAgent and waits for the SQLite store or WAL to change. If the daemon does not refresh the store, the CLI launches Voice Memos hidden, waits for synchronization, and quits only the app instance it launched.
+
+Use cached local data when latency matters more than freshness:
+
+```bash
+apple-voice-memos-pp-cli recent --cached
+```
+
+`list` remains cached by default because it is commonly used for historical searches. Pass `--fresh` when current iCloud state matters.
 
 ## Transcript extraction
 

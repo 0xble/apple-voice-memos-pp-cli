@@ -24,7 +24,7 @@ import (
 
 const (
 	cliName           = "apple-voice-memos-pp-cli"
-	version           = "0.1.0-local"
+	version           = "0.2.0-local"
 	coreDataEpochUnix = 978307200 // 2001-01-01T00:00:00Z
 )
 
@@ -52,6 +52,12 @@ type memo struct {
 var cfg config
 
 func main() {
+	if err := buildRootCommand().Execute(); err != nil {
+		os.Exit(1)
+	}
+}
+
+func buildRootCommand() *cobra.Command {
 	root := &cobra.Command{
 		Use:     cliName,
 		Short:   "Local, read-only CLI for Apple Voice Memos on macOS",
@@ -77,10 +83,8 @@ No network calls. No writes to Apple's database. Export copies audio files only 
 		return nil
 	}
 
-	root.AddCommand(cmdDoctor(), cmdList(), cmdRecent(), cmdTranscript(), cmdExport(), cmdAgentContext(), cmdWhich())
-	if err := root.Execute(); err != nil {
-		os.Exit(1)
-	}
+	root.AddCommand(cmdDoctor(), cmdSync(), cmdList(), cmdRecent(), cmdTranscript(), cmdExport(), cmdAgentContext(), cmdWhich())
+	return root
 }
 
 func cmdDoctor() *cobra.Command {
@@ -119,13 +123,38 @@ func cmdDoctor() *cobra.Command {
 	}
 }
 
+func cmdSync() *cobra.Command {
+	return &cobra.Command{
+		Use:   "sync",
+		Short: "Refresh the local Voice Memos store through voicememod with a hidden-app fallback",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			result, err := runSync(cmd.Context())
+			if err != nil {
+				return err
+			}
+			printJSON(result)
+			return nil
+		},
+	}
+}
+
 func cmdList() *cobra.Command {
 	var limit, offset int
 	var search, after, before, format string
+	var fresh bool
 	c := &cobra.Command{
 		Use:   "list",
 		Short: "List Voice Memos metadata",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if fresh {
+				result, err := runSync(cmd.Context())
+				if err != nil {
+					return fmt.Errorf("refresh Voice Memos store: %w", err)
+				}
+				if result.Warning != "" && !cfg.JSON {
+					cmd.PrintErrf("sync: %s\n", result.Warning)
+				}
+			}
 			memos, err := queryMemos(limit, offset, search, after, before)
 			if err != nil {
 				return err
@@ -147,6 +176,7 @@ func cmdList() *cobra.Command {
 	c.Flags().StringVar(&after, "after", "", "only recordings on/after YYYY-MM-DD")
 	c.Flags().StringVar(&before, "before", "", "only recordings on/before YYYY-MM-DD")
 	c.Flags().StringVar(&format, "format", "table", "output format: table, json, csv")
+	c.Flags().BoolVar(&fresh, "fresh", false, "refresh through iCloud before listing")
 	c.PreRun = func(cmd *cobra.Command, args []string) {
 		if cfg.JSON || cfg.Agent {
 			format = "json"
@@ -157,10 +187,20 @@ func cmdList() *cobra.Command {
 
 func cmdRecent() *cobra.Command {
 	var limit int
+	var cached bool
 	c := &cobra.Command{
 		Use:   "recent",
-		Short: "List recent Voice Memos",
+		Short: "Refresh and list recent Voice Memos",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if !cached {
+				result, err := runSync(cmd.Context())
+				if err != nil {
+					return fmt.Errorf("refresh Voice Memos store: %w (pass --cached to use local data)", err)
+				}
+				if result.Warning != "" && !cfg.JSON {
+					cmd.PrintErrf("sync: %s\n", result.Warning)
+				}
+			}
 			memos, err := queryMemos(limit, 0, "", "", "")
 			if err != nil {
 				return err
@@ -174,6 +214,7 @@ func cmdRecent() *cobra.Command {
 		},
 	}
 	c.Flags().IntVar(&limit, "limit", 10, "maximum rows")
+	c.Flags().BoolVar(&cached, "cached", false, "skip iCloud refresh and use the local store immediately")
 	return c
 }
 
@@ -260,7 +301,7 @@ func cmdAgentContext() *cobra.Command {
 	c := &cobra.Command{Use: "agent-context", Short: "Describe CLI capabilities for agents", RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := map[string]any{
 			"cli": cliName, "version": version, "side_effects": "read-only except export copies selected audio files", "auth": "none", "network": false,
-			"commands":   []string{"doctor", "list", "recent", "transcript", "export", "which", "agent-context"},
+			"commands":   []string{"doctor", "sync", "list", "recent", "transcript", "export", "which", "agent-context"},
 			"default_db": defaultDBPath(), "default_recordings_dir": defaultRecordingsDir(),
 		}
 		b, _ := json.Marshal(ctx)

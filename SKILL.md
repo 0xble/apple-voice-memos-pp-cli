@@ -25,6 +25,9 @@ apple-voice-memos-pp-cli
 - Reads local macOS Voice Memos data only.
 - Does not call a network API.
 - Does not modify Apple's database.
+- `recent` refreshes through `voicememod` by default. Use `--cached` only when stale local data is acceptable.
+- `list` is cached by default. Use `list --fresh` when current iCloud state matters.
+- The sync fallback launches Voice Memos hidden and quits only the app instance the CLI launched.
 - `export` copies a selected `.m4a` to an output directory.
 - Prefer `--agent` for JSON and stable scripting.
 
@@ -32,8 +35,10 @@ apple-voice-memos-pp-cli
 
 ```bash
 apple-voice-memos-pp-cli doctor --agent
+apple-voice-memos-pp-cli sync --agent
 apple-voice-memos-pp-cli recent --limit 10 --agent
-apple-voice-memos-pp-cli list --search "keyword" --agent
+apple-voice-memos-pp-cli recent --cached --limit 10 --agent
+apple-voice-memos-pp-cli list --fresh --search "keyword" --agent
 apple-voice-memos-pp-cli transcript <id> --agent
 apple-voice-memos-pp-cli export <id> --out ~/Downloads --agent
 ```
