@@ -403,10 +403,10 @@ func findMemo(key string) (memo, error) {
 }
 
 func coreDataToTime(seconds float64) time.Time {
-	return time.Unix(coreDataEpochUnix+int64(seconds), int64((seconds-math.Floor(seconds))*1e9)).UTC()
+	return time.Unix(coreDataEpochUnix+int64(seconds), int64((seconds-math.Floor(seconds))*1e9)).In(time.Local)
 }
 func dateToCoreData(s string, endOfDay bool) (float64, error) {
-	t, err := time.ParseInLocation("2006-01-02", s, time.UTC)
+	t, err := time.ParseInLocation("2006-01-02", s, time.Local)
 	if err != nil {
 		return 0, fmt.Errorf("expected YYYY-MM-DD: %w", err)
 	}
