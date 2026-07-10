@@ -282,6 +282,13 @@ func cmdRecent() *cobra.Command {
 	return c
 }
 
+func requireMemoLocal(m memo) error {
+	if !m.Exists || m.Path == "" {
+		return fmt.Errorf("recording %d is not downloaded locally; run sync to refresh iCloud", m.ID)
+	}
+	return nil
+}
+
 func cmdTranscript() *cobra.Command {
 	var raw bool
 	c := &cobra.Command{
@@ -291,6 +298,9 @@ func cmdTranscript() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			m, err := findMemo(args[0])
 			if err != nil {
+				return err
+			}
+			if err := requireMemoLocal(m); err != nil {
 				return err
 			}
 			text, segments, err := extractTranscript(m.Path)
@@ -326,6 +336,9 @@ func cmdExport() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			m, err := findMemo(args[0])
 			if err != nil {
+				return err
+			}
+			if err := requireMemoLocal(m); err != nil {
 				return err
 			}
 			if outDir == "" {
